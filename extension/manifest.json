@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "AI code editor Web Observer",
+  "version": "1.0",
+  "description": "Allows AI code editors to observe and modify web pages",
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "tabs"
+  ],
+  "host_permissions": [
+    "*://*/*",
+    "ws://localhost:*/"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_icon": {
+      "16": "icons/icon16_inactive.png",
+      "48": "icons/icon48_inactive.png",
+      "128": "icons/icon128_inactive.png"
+    },
+    "default_title": "Activate AI code editor Web Observer"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+} 
