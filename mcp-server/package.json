@@ -2,14 +2,17 @@
   "name": "page-control-mcp",
   "version": "1.0.0",
   "description": "MCP server for controlling web pages",
-  "main": "server.js",
+  "main": "page-control-mcp.js",
+  "type": "module",
   "scripts": {
-    "start": "node server.js"
+    "start": "node page-control-mcp.js"
   },
   "dependencies": {
     "express": "^4.18.2",
     "cors": "^2.8.5",
     "uuid": "^9.0.1",
-    "ws": "^8.16.0"
+    "ws": "^8.16.0",
+    "@modelcontextprotocol/sdk": "latest",
+    "zod": "^3.22.4"
   }
 } 

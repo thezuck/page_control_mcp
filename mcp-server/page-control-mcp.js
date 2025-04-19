@@ -1,548 +1,132 @@
-const express = require('express');
-const cors = require('cors');
-const { v4: uuidv4 } = require('uuid');
-const WebSocket = require('ws');
+import express from 'express';
+import cors from 'cors';
+import { v4 as uuidv4 } from 'uuid';
+import { WebSocketServer, WebSocket } from 'ws';
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { z } from "zod";
+import process from "node:process";
+import {
+    logDebug,
+    pendingRequests,
+    broadcastToPages,
+    executeQueryPage,
+    executeModifyPage,
+    executeRunSnippet,
+    executeListPages,
+    handlePageResponse,
+    cleanupStaleRequests
+} from './page-control-commands.js';
 
-const app = express();
-const port = 4000;
-
-// Enable CORS and JSON parsing
-app.use(cors());
-app.use(express.json());
-
-// Store active page connections
-const activePages = new Map();
-// Store SSE sessions
-const sessions = new Map();
-
-// WebSocket server for page connections
-const wss = new WebSocket.Server({ port: 3001 });
-
-console.log('Starting MCP server...');
-
-// Enhanced logging
-const logDebug = (component, message, data = null) => {
-    const timestamp = new Date().toISOString();
-    const dataStr = data ? JSON.stringify(data, null, 2) : '';
-    console.log(`[DEBUG][${timestamp}][${component}] ${message}${dataStr ? '\n' + dataStr : ''}`);
+// Log to stderr to avoid interfering with STDIO transport
+const logStderr = (message) => {
+    console.error(`[PAGE-CONTROL-MCP] ${message}`);
 };
 
-// Map to store pending requests waiting for responses
-const pendingRequests = new Map();
+// Determine if we're running in pure STDIO mode
+const isStdioMode = process.argv.includes('--stdio-only');
 
-// Broadcast a message to all connected pages
-const broadcastToPages = (message) => {
-    logDebug('BROADCAST', `Broadcasting message to ${activePages.size} pages`);
-    activePages.forEach((ws, pageId) => {
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({
-                type: 'activity',
-                message
-            }));
-        }
-    });
-};
-
-// STDIO handling for Zencoder support
-let stdioBuffer = '';
-
-// Function to send response via STDIO
-const sendStdioResponse = (response) => {
-    logDebug('STDIO', 'Sending response via STDIO', response);
-    process.stdout.write(JSON.stringify(response) + '\n');
-};
-
-// Function to process JSONRPC messages (used by both SSE and STDIO)
-const processJsonRpcMessage = (rpc, transport, sessionId = null, sseRes = null) => {
-    logDebug('RPC', `Processing ${transport} message: ${rpc.method}`, rpc);
-
-    // Helper function to send a response based on transport
-    const sendResponse = (response) => {
-        if (transport === 'SSE' && sseRes) {
-            sseRes.write(`event: message\n`);
-            sseRes.write(`data: ${JSON.stringify(response)}\n\n`);
-            logDebug('SSE', `Sent response via SSE`, response);
-        } else if (transport === 'STDIO') {
-            sendStdioResponse(response);
-        }
-    };
-
-    switch (rpc.method) {
-        case 'initialize': {
-            if (sessionId && sessions.has(sessionId)) {
-                sessions.get(sessionId).initialized = true;
+// Create logging utilities that respect STDIO mode
+const safeLog = {
+    info: (message) => {
+        if (!isStdioMode) {
+            console.log(message);
+        } else {
+            // In STDIO mode, redirect to stderr only if debugging is enabled
+            if (process.env.DEBUG) {
+                console.error(`[PAGE-CONTROL-MCP] INFO: ${message}`);
             }
-            
-            const response = {
-                jsonrpc: '2.0',
-                id: rpc.id,
-                result: {
-                    protocolVersion: '2024-11-05',
-                    capabilities: {
-                        tools: { listChanged: true },
-                        resources: { subscribe: true, listChanged: true },
-                        prompts: { listChanged: true },
-                        logging: {}
-                    },
-                    serverInfo: {
-                        name: 'page-control-mcp',
-                        version: '1.0.0'
-                    }
-                }
-            };
-            sendResponse(response);
-            console.log(`📤 Sent initialization response via ${transport}`);
-            break;
         }
-
-        case 'tools/list': {
-            const response = {
-                jsonrpc: '2.0',
-                id: rpc.id,
-                result: {
-                    tools: [
-                        {
-                            name: 'query_page',
-                            description: 'Query elements on a web page using CSS selector',
-                            inputSchema: {
-                                type: 'object',
-                                properties: {
-                                    pageId: {
-                                        type: 'string',
-                                        description: 'ID of the connected page'
-                                    },
-                                    selector: {
-                                        type: 'string',
-                                        description: 'CSS selector to query elements'
-                                    }
-                                },
-                                required: ['pageId', 'selector']
-                            }
-                        },
-                        {
-                            name: 'modify_page',
-                            description: 'Modify elements on a web page',
-                            inputSchema: {
-                                type: 'object',
-                                properties: {
-                                    targetPage: {
-                                        type: 'string',
-                                        description: 'ID of the page to modify'
-                                    },
-                                    modification: {
-                                        type: 'object',
-                                        properties: {
-                                            selector: {
-                                                type: 'string',
-                                                description: 'CSS selector for target elements'
-                                            },
-                                            operation: {
-                                                type: 'string',
-                                                description: 'Type of modification (setAttribute, setProperty, setInnerHTML, setTextContent)'
-                                            },
-                                            value: {
-                                                type: 'string',
-                                                description: 'New value to set'
-                                            }
-                                        },
-                                        required: ['selector', 'operation', 'value']
-                                    }
-                                },
-                                required: ['targetPage', 'modification']
-                            }
-                        },
-                        {
-                            name: 'run_snippet',
-                            description: 'Execute a JavaScript code snippet in the context of the page',
-                            inputSchema: {
-                                type: 'object',
-                                properties: {
-                                    pageId: {
-                                        type: 'string',
-                                        description: 'ID of the page to execute the snippet on'
-                                    },
-                                    code: {
-                                        type: 'string',
-                                        description: 'JavaScript code to execute'
-                                    }
-                                },
-                                required: ['pageId', 'code']
-                            }
-                        },
-                        {
-                            name: 'list_pages',
-                            description: 'List all connected pages',
-                            inputSchema: {
-                                type: 'object',
-                                properties: {},
-                                required: []
-                            }
-                        }
-                    ],
-                    count: 4
-                }
-            };
-            sendResponse(response);
-            console.log(`📤 Sent tools list via ${transport}`);
-            break;
-        }
-
-        case 'tools/call': {
-            const toolName = rpc.params?.name;
-            const args = rpc.params?.arguments || {};
-            logDebug('TOOL_CALL', `Received tool call via ${transport}: ${toolName}`, args);
-
-            let result;
-            switch (toolName) {
-                case 'query_page':
-                    logDebug('QUERY', `Querying page ${args.pageId} with selector "${args.selector}"`);
-                    const ws = activePages.get(args.pageId);
-                    if (!ws) {
-                        const pages = Array.from(activePages.keys());
-                        logDebug('QUERY_ERROR', `Page "${args.pageId}" not found. Available pages: ${pages.join(', ')}`);
-                        
-                        const error = {
-                            jsonrpc: '2.0',
-                            id: rpc.id,
-                            error: {
-                                code: -32000,
-                                message: `Page "${args.pageId}" is not connected. Currently connected pages: ${pages.length > 0 ? pages.join(', ') : 'none'}`
-                            }
-                        };
-                        sendResponse(error);
-                        logDebug('QUERY_ERROR', `Sent error response via ${transport}:`, error);
-
-                        // Broadcast the disconnected page error to all pages
-                        broadcastToPages(`Query failed: Page "${args.pageId}" is not connected. Available pages: ${pages.length > 0 ? pages.join(', ') : 'none'}`);
-                        return;
-                    }
-
-                    // Store the request for later matching with response
-                    pendingRequests.set(rpc.id, { 
-                        sessionId, 
-                        transport,
-                        method: 'query_page',
-                        timestamp: Date.now() 
-                    });
-                    logDebug('QUERY', `Added pending request ${rpc.id} for ${transport} ${sessionId ? 'session ' + sessionId : ''}`);
-
-                    // Send query command to the page
-                    const queryCommand = JSON.stringify({
-                        command: 'query_page',
-                        params: {
-                            selector: args.selector
-                        },
-                        id: rpc.id
-                    });
-                    ws.send(queryCommand);
-                    logDebug('QUERY', `Sent query command to page ${args.pageId}:`, queryCommand);
-
-                    // Broadcast query activity to all pages
-                    broadcastToPages(`Query executed on ${args.pageId}: ${args.selector}`);
-                    break;
-
-                case 'modify_page':
-                    logDebug('MODIFY', `Modifying page ${args.targetPage}`, args.modification);
-                    const targetWs = activePages.get(args.targetPage);
-                    if (!targetWs) {
-                        const pages = Array.from(activePages.keys());
-                        logDebug('MODIFY_ERROR', `Page "${args.targetPage}" not found. Available pages: ${pages.join(', ')}`);
-                        
-                        const error = {
-                            jsonrpc: '2.0',
-                            id: rpc.id,
-                            error: {
-                                code: -32000,
-                                message: `Page "${args.targetPage}" is not connected. Currently connected pages: ${pages.length > 0 ? pages.join(', ') : 'none'}`
-                            }
-                        };
-                        sendResponse(error);
-                        logDebug('MODIFY_ERROR', `Sent error response via ${transport}:`, error);
-
-                        // Broadcast the disconnected page error to all pages
-                        broadcastToPages(`Modification failed: Page "${args.targetPage}" is not connected. Available pages: ${pages.length > 0 ? pages.join(', ') : 'none'}`);
-                        return;
-                    }
-
-                    // Store the request for later matching with response
-                    pendingRequests.set(rpc.id, { 
-                        sessionId, 
-                        transport,
-                        method: 'modify_page',
-                        timestamp: Date.now() 
-                    });
-                    logDebug('MODIFY', `Added pending request ${rpc.id} for ${transport} ${sessionId ? 'session ' + sessionId : ''}`);
-
-                    // Send modify command to the page
-                    const modifyCommand = JSON.stringify({
-                        command: 'modify_page',
-                        params: args.modification,
-                        id: rpc.id
-                    });
-                    targetWs.send(modifyCommand);
-                    logDebug('MODIFY', `Sent modify command to page ${args.targetPage}:`, modifyCommand);
-
-                    // Broadcast modification activity to all pages
-                    broadcastToPages(`Page ${args.targetPage} modified: ${args.modification.operation} on ${args.modification.selector}`);
-                    break;
-
-                case 'run_snippet':
-                    logDebug('SNIPPET', `Running snippet on page ${args.pageId}`);
-                    const snippetWs = activePages.get(args.pageId);
-                    if (!snippetWs) {
-                        const pages = Array.from(activePages.keys());
-                        logDebug('SNIPPET_ERROR', `Page "${args.pageId}" not found. Available pages: ${pages.join(', ')}`);
-                        
-                        const error = {
-                            jsonrpc: '2.0',
-                            id: rpc.id,
-                            error: {
-                                code: -32000,
-                                message: `Page "${args.pageId}" is not connected. Currently connected pages: ${pages.length > 0 ? pages.join(', ') : 'none'}`
-                            }
-                        };
-                        sendResponse(error);
-                        logDebug('SNIPPET_ERROR', `Sent error response via ${transport}:`, error);
-
-                        // Broadcast the disconnected page error to all pages
-                        broadcastToPages(`Snippet execution failed: Page "${args.pageId}" is not connected. Available pages: ${pages.length > 0 ? pages.join(', ') : 'none'}`);
-                        return;
-                    }
-
-                    // Store the request for later matching with response
-                    pendingRequests.set(rpc.id, { 
-                        sessionId, 
-                        transport,
-                        method: 'run_snippet',
-                        timestamp: Date.now() 
-                    });
-                    logDebug('SNIPPET', `Added pending request ${rpc.id} for ${transport} ${sessionId ? 'session ' + sessionId : ''}`);
-
-                    // Send snippet command to the page
-                    const snippetCommand = JSON.stringify({
-                        command: 'run_snippet',
-                        params: {
-                            code: args.code
-                        },
-                        id: rpc.id
-                    });
-                    snippetWs.send(snippetCommand);
-                    logDebug('SNIPPET', `Sent snippet command to page ${args.pageId}`, { 
-                        id: rpc.id, 
-                        codeLength: args.code.length 
-                    });
-
-                    // Broadcast snippet activity to all pages
-                    broadcastToPages(`Executing code snippet on ${args.pageId} (${args.code.length} characters)`);
-                    break;
-
-                case 'list_pages':
-                    const pages = Array.from(activePages.keys());
-                    logDebug('LIST', `Listing connected pages: ${pages.join(', ')}`);
-                    result = { pages };
-
-                    // Broadcast list pages activity to all pages
-                    broadcastToPages(`Listed ${pages.length} connected pages`);
-
-                    const response = {
-                        jsonrpc: '2.0',
-                        id: rpc.id,
-                        result: {
-                            content: [
-                                {
-                                    type: 'text',
-                                    text: JSON.stringify(result)
-                                }
-                            ]
-                        }
-                    };
-                    sendResponse(response);
-                    logDebug('LIST', `Sent list response via ${transport}:`, response);
-                    break;
-
-                default:
-                    logDebug('TOOL_ERROR', `Unknown tool: ${toolName}`);
-                    const error = {
-                        jsonrpc: '2.0',
-                        id: rpc.id,
-                        error: {
-                            code: -32601,
-                            message: `Unknown tool: ${toolName}`
-                        }
-                    };
-                    sendResponse(error);
-                    logDebug('TOOL_ERROR', `Sent error response via ${transport}:`, error);
-                    return;
+    },
+    error: (message) => {
+        if (!isStdioMode) {
+            console.error(message); // Always use stderr for errors
+        } else {
+            // In STDIO mode, only log errors if debugging is enabled
+            if (process.env.DEBUG) {
+                console.error(`[PAGE-CONTROL-MCP] ERROR: ${message}`);
             }
-            break;
         }
-
-        case 'notifications/initialized': {
-            logDebug('NOTIFICATION', `Client initialized via ${transport}`);
-            break;
-        }
-
-        case 'notifications/cancelled': {
-            logDebug('NOTIFICATION', `Request cancelled via ${transport}`, rpc.params);
-            // If there was a requestId, remove it from pending requests
-            if (rpc.params?.requestId) {
-                pendingRequests.delete(rpc.params.requestId);
-                logDebug('NOTIFICATION', `Removed cancelled request ${rpc.params.requestId} from pending requests`);
-            }
-            break;
-        }
-
-        default: {
-            logDebug('METHOD_ERROR', `Unknown method: ${rpc.method}`);
-            const error = {
-                jsonrpc: '2.0',
-                id: rpc.id,
-                error: {
-                    code: -32601,
-                    message: `Method not found: ${rpc.method}`
-                }
-            };
-            sendResponse(error);
-            logDebug('METHOD_ERROR', `Sent error response via ${transport}:`, error);
+    },
+    debug: (component, message, data) => {
+        // Use the existing logDebug function for debugging
+        if (!isStdioMode || process.env.DEBUG) {
+            logDebug(component, message, data);
         }
     }
 };
 
-// Handle STDIO input for Zencoder
-if (process.stdin.isTTY) {
-    console.log('Running in TTY mode, STDIO transport available');
-} else {
-    console.log('Running in non-TTY mode, STDIO transport active');
-    
-    // Set up STDIO handling
-    process.stdin.setEncoding('utf8');
-    
-    process.stdin.on('data', (chunk) => {
-        stdioBuffer += chunk;
-        logDebug('STDIO', `Received data chunk, buffer length: ${stdioBuffer.length}`);
-        
-        // Process complete JSON messages
-        let newlineIndex;
-        while ((newlineIndex = stdioBuffer.indexOf('\n')) !== -1) {
-            const line = stdioBuffer.substring(0, newlineIndex);
-            stdioBuffer = stdioBuffer.substring(newlineIndex + 1);
-            
-            if (line.trim()) {
-                try {
-                    const message = JSON.parse(line);
-                    logDebug('STDIO', 'Parsed JSON message:', message);
-                    
-                    if (message.jsonrpc === '2.0') {
-                        processJsonRpcMessage(message, 'STDIO');
-                    } else {
-                        logDebug('STDIO_ERROR', 'Invalid JSON-RPC message:', message);
-                        sendStdioResponse({
-                            jsonrpc: '2.0',
-                            id: message.id || null,
-                            error: {
-                                code: -32600,
-                                message: 'Invalid JSON-RPC request'
-                            }
-                        });
-                    }
-                } catch (error) {
-                    logDebug('STDIO_ERROR', `Error parsing JSON: ${error.message}`);
-                    sendStdioResponse({
-                        jsonrpc: '2.0',
-                        id: null,
-                        error: {
-                            code: -32700,
-                            message: `Parse error: ${error.message}`
-                        }
-                    });
-                }
-            }
-        }
-    });
-    
-    process.stdin.on('end', () => {
-        logDebug('STDIO', 'Input stream ended');
-    });
+// Startup message - only show if not in STDIO mode or if DEBUG is enabled
+if (!isStdioMode) {
+    logStderr("Starting Page Control MCP Server with SSE endpoint...");
+} else if (process.env.DEBUG) {
+    logStderr("Starting Page Control MCP Server in STDIO mode only...");
 }
 
+// Store active page connections (shared between modes)
+const activePages = new Map();
+
+// WebSocket server for page connections - shared by both modes
+const wss = new WebSocketServer({ port: 3001 });
+
+// Store service health information
+let serviceHealth = {
+    status: 'ok',
+    lastError: null,
+    lastErrorTime: null,
+    wsConnectionStatus: 'ok',
+    connectedPages: 0,
+    startTime: Date.now()
+};
+
+// Track WebSocket server errors
+wss.on('error', (error) => {
+    if (process.env.DEBUG) {
+        safeLog.error(`[ERROR] WebSocket server error: ${error.message}`);
+    }
+    serviceHealth.status = 'error';
+    serviceHealth.lastError = `WebSocket server error: ${error.message}`;
+    serviceHealth.lastErrorTime = Date.now();
+    serviceHealth.wsConnectionStatus = 'error';
+});
+
+// Function to sync the serviceHealth connected pages count with activePages
+const syncConnectedPagesCount = () => {
+    serviceHealth.connectedPages = activePages.size;
+};
+
+// WebSocket connection handler - shared by both modes
 wss.on('connection', (ws) => {
     logDebug('WS', 'New WebSocket connection from browser page');
     let pageId = null;
 
     ws.on('message', (message) => {
         try {
-        const data = JSON.parse(message);
+            const data = JSON.parse(message.toString());
             logDebug('WS_MESSAGE', `Received WebSocket message:`, data);
 
-        if (data.type === 'page_connected') {
-            pageId = data.pageId;
-            activePages.set(pageId, ws);
-                logDebug('PAGE', `Page ${pageId} registered, total pages: ${activePages.size}`);
-                
-                // Broadcast new page connection to all pages
-                broadcastToPages(`New page connected: ${pageId} (${data.title || 'Untitled'}) - ${data.url || 'No URL'}`);
-            } else if (data.type === 'response') {
-                logDebug('RESPONSE', `Received response from page ${data.pageId} for request ${data.requestId}`, data);
-                
-                // Check if this is a response to a pending request
-                if (pendingRequests.has(data.requestId)) {
-                    const { sessionId, transport, method } = pendingRequests.get(data.requestId);
-                    logDebug('RESPONSE', `Found pending request ${data.requestId} for ${transport} ${sessionId ? 'session ' + sessionId : ''}, method ${method}`);
+            try {
+                if (data.type === 'page_connected') {
+                    pageId = data.pageId;
+                    activePages.set(pageId, ws);
+                    logDebug('PAGE', `Page ${pageId} registered, total pages: ${activePages.size}`);
                     
-                    // Format response
-                    const responseBody = {
-                        jsonrpc: '2.0',
-                        id: data.requestId,
-                        result: {
-                            content: [
-                                {
-                                    type: 'text',
-                                    text: JSON.stringify(data.error ? { error: data.error } : data)
-                                }
-                            ]
-                        }
-                    };
+                    // Broadcast new page connection to all pages
+                    broadcastToPages(activePages, `New page connected: ${pageId} (${data.title || 'Untitled'}) - ${data.url || 'No URL'}`);
                     
-                    // Handle errors
-                    if (data.error) {
-                        logDebug('RESPONSE', `Error in response: ${data.error}`);
-                        responseBody.error = {
-                            code: -32000,
-                            message: data.error
-                        };
-                        delete responseBody.result;
-                        
-                        broadcastToPages(`Error from page ${data.pageId}: ${data.error}`);
-                    } else {
-                        logDebug('RESPONSE', `Successful response from page ${data.pageId}`);
-                        broadcastToPages(`Received successful response from page ${data.pageId}`);
-                    }
-                    
-                    // Send response based on transport
-                    if (transport === 'SSE') {
-                        const sessionData = sessions.get(sessionId);
-                        if (sessionData && sessionData.sseRes) {
-                            sessionData.sseRes.write(`event: message\n`);
-                            sessionData.sseRes.write(`data: ${JSON.stringify(responseBody)}\n\n`);
-                            logDebug('RESPONSE', `Sent response to the AI editor:`, responseBody);
-                        } else {
-                            logDebug('RESPONSE', `Session ${sessionId} not found or has no SSE response`);
-                        }
-                    } else if (transport === 'STDIO') {
-                        sendStdioResponse(responseBody);
-                    }
-                    
-                    // Clean up pending request
-                    pendingRequests.delete(data.requestId);
-                    logDebug('RESPONSE', `Deleted pending request ${data.requestId}, remaining: ${pendingRequests.size}`);
+                    // Update service health with new count
+                    syncConnectedPagesCount();
+                } else if (data.type === 'response') {
+                    // Use the shared response handler
+                    handlePageResponse(data, activePages);
                 } else {
-                    logDebug('RESPONSE', `No pending request found for ID ${data.requestId}. Current pending: ${Array.from(pendingRequests.keys()).join(', ')}`);
+                    logDebug('WS_MESSAGE', `Unknown message type: ${data.type}`);
                 }
-            } else {
-                logDebug('WS_MESSAGE', `Unknown message type: ${data.type}`);
+            } catch (processingError) {
+                logDebug('WS_PROCESSING_ERROR', `Error processing message data: ${processingError.message}`);
             }
         } catch (error) {
-            logDebug('WS_ERROR', `Error processing WebSocket message: ${error.message}`);
+            logDebug('WS_ERROR', `Error parsing WebSocket message: ${error.message}`);
         }
     });
 
@@ -552,108 +136,784 @@ wss.on('connection', (ws) => {
             logDebug('WS', `Page ${pageId} disconnected, total pages: ${activePages.size}`);
             
             // Broadcast page disconnection to all pages
-            broadcastToPages(`Page disconnected: ${pageId}`);
+            broadcastToPages(activePages, `Page disconnected: ${pageId}`);
+            
+            // Update service health with new count
+            syncConnectedPagesCount();
         } else {
             logDebug('WS', 'Unregistered WebSocket connection closed');
         }
     });
 
     ws.on('error', (error) => {
-        logDebug('WS_ERROR', `WebSocket error: ${error.message}`);
+        if (process.env.DEBUG) {
+            logDebug('WS_ERROR', `WebSocket connection error: ${error.message}`);
+        }
+        serviceHealth.status = 'degraded';
+        serviceHealth.lastError = `WebSocket connection error: ${error.message}`;
+        serviceHealth.lastErrorTime = Date.now();
+        serviceHealth.wsConnectionStatus = 'degraded';
     });
 });
 
-// SSE endpoint for AI editors that support SSE, e.g. Cursor
-app.get('/page-control', (req, res) => {
-    console.log('🔌 New SSE connection from AI editor');
+// Function to safely execute tool handlers with error handling
+const safeToolHandler = async (fn, ...args) => {
+    try {
+        return await fn(...args);
+    } catch (error) {
+        if (process.env.DEBUG) {
+            safeLog.error(`[ERROR] Tool execution error: ${error.message}`);
+        }
+        // Return a graceful error response rather than crashing
+        throw {
+            code: -32000,
+            message: `Tool execution failed: ${error.message}`
+        };
+    }
+};
 
-    // SSE headers
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
+// Add regular synchronization for both modes
+setInterval(() => {
+    // Synchronize the connected pages count
+    syncConnectedPagesCount();
+    
+    // Perform additional health checks if needed
+    if (isStdioMode) {
+        // STDIO-specific checks if needed
+    } else {
+        // SSE-specific checks if needed
+    }
+}, 5000); // Check every 5 seconds
 
-    // Generate sessionId
-    const sessionId = uuidv4();
-    sessions.set(sessionId, { sseRes: res, initialized: false });
-    console.log('📝 Created sessionId:', sessionId);
-
-    // Send endpoint event
-    res.write(`event: endpoint\n`);
-    res.write(`data: /message?sessionId=${sessionId}\n\n`);
-
-    // Heartbeat every 10 seconds
-    const heartbeat = setInterval(() => {
-        res.write(`event: heartbeat\ndata: ${Date.now()}\n\n`);
-    }, 10000);
-
-    // Cleanup on disconnect
-    req.on('close', () => {
-        clearInterval(heartbeat);
-        sessions.delete(sessionId);
-        console.log('🔌 SSE connection closed, sessionId:', sessionId);
+// ===== Create MCP SDK Server for STDIO mode =====
+if (isStdioMode) {
+    // Create an MCP server for SDK-based transport
+    const sdkServer = new McpServer({
+        name: "Page Control MCP SDK Server",
+        version: "1.0.0"
     });
-});
 
-// Message endpoint for JSON-RPC communication
-app.post('/message', (req, res) => {
-    logDebug('HTTP', `Received message:`, req.body);
-    logDebug('HTTP', `Query params:`, req.query);
+    // Add error handler for SDK server
+    process.on('uncaughtException', (error) => {
+        logStderr(`[ERROR] Uncaught Exception: ${error.message}`);
+        logStderr(error.stack);
+        // Continue running, don't exit
+    });
 
-    const sessionId = req.query.sessionId;
-    if (!sessionId) {
-        logDebug('HTTP_ERROR', 'Missing sessionId in query');
-        return res.status(400).json({ error: 'Missing sessionId in query' });
-    }
+    // Handle errors in stdin parsing
+    process.stdin.on('error', (error) => {
+        logStderr(`[ERROR] STDIN Error: ${error.message}`);
+        // Continue running, don't exit
+    });
 
-    const sessionData = sessions.get(sessionId);
-    if (!sessionData) {
-        logDebug('HTTP_ERROR', `No SSE session found for sessionId: ${sessionId}`);
-        return res.status(404).json({ error: 'No SSE session found for sessionId' });
-    }
+    // Add the query_page tool with shared implementation
+    sdkServer.tool(
+        "query_page",
+        {
+            pageId: z.string(),
+            selector: z.string()
+        },
+        async ({ pageId, selector }) => {
+            return await safeToolHandler(async () => {
+                if (process.env.DEBUG) {
+                    safeLog.error(`[SDK] Received query_page call: pageId=${pageId}, selector=${selector}`);
+                }
+                
+                // Use the shared implementation
+                const result = await executeQueryPage(pageId, selector, activePages);
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: JSON.stringify(result)
+                        }
+                    ]
+                };
+            });
+        }
+    );
 
-    const rpc = req.body;
-    if (!rpc || rpc.jsonrpc !== '2.0' || !rpc.method) {
-        logDebug('HTTP_ERROR', 'Invalid JSON-RPC request');
-        return res.json({
-            jsonrpc: '2.0',
-            id: rpc?.id ?? null,
-            error: {
-                code: -32600,
-                message: 'Invalid JSON-RPC request'
+    // Add the modify_page tool with shared implementation
+    sdkServer.tool(
+        "modify_page",
+        {
+            targetPage: z.string(),
+            modification: z.object({
+                selector: z.string(),
+                operation: z.string(),
+                value: z.string()
+            }).strict()
+        },
+        async ({ targetPage, modification }) => {
+            return await safeToolHandler(async () => {
+                if (process.env.DEBUG) {
+                    safeLog.error(`[SDK] Received modify_page call: targetPage=${targetPage}, modification=${JSON.stringify(modification)}`);
+                }
+                
+                // Use the shared implementation
+                const result = await executeModifyPage(targetPage, modification, activePages);
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: JSON.stringify(result)
+                        }
+                    ]
+                };
+            });
+        }
+    );
+
+    // Add the run_snippet tool with shared implementation
+    sdkServer.tool(
+        "run_snippet",
+        {
+            pageId: z.string(),
+            code: z.string()
+        },
+        async ({ pageId, code }) => {
+            return await safeToolHandler(async () => {
+                if (process.env.DEBUG) {
+                    safeLog.error(`[SDK] Received run_snippet call: pageId=${pageId}, code length=${code.length}`);
+                }
+                
+                // Use the shared implementation
+                const result = await executeRunSnippet(pageId, code, activePages);
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: JSON.stringify(result)
+                        }
+                    ]
+                };
+            });
+        }
+    );
+
+    // Add the list_pages tool with shared implementation
+    sdkServer.tool(
+        "list_pages",
+        {
+            random_string: z.string().optional()
+        },
+        async (args) => {
+            return await safeToolHandler(async () => {
+                // Use the shared implementation
+                const result = executeListPages(activePages);
+                if (process.env.DEBUG) {
+                    safeLog.error(`[SDK] Listed ${result.count} connected pages`);
+                }
+                
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: JSON.stringify(result)
+                        }
+                    ]
+                };
+            });
+        }
+    );
+
+    // Add the page_control_status tool
+    sdkServer.tool(
+        "page_control_status",
+        {
+            detail_level: z.string().optional()
+        },
+        async ({ detail_level = "basic" }) => {
+            return await safeToolHandler(async () => {
+                if (process.env.DEBUG) {
+                    safeLog.error(`[SDK] Received page_control_status call, detail level: ${detail_level}`);
+                }
+                
+                // Update connected pages count before returning status
+                syncConnectedPagesCount();
+                
+                // Calculate uptime
+                const uptime = Math.floor((Date.now() - serviceHealth.startTime) / 1000);
+                
+                // Basic status information
+                const statusInfo = {
+                    status: serviceHealth.status,
+                    uptime_seconds: uptime,
+                    connected_pages: serviceHealth.connectedPages,
+                    websocket_status: serviceHealth.wsConnectionStatus,
+                    server_type: "STDIO"
+                };
+                
+                // Add detailed information if requested
+                if (detail_level === "detailed") {
+                    statusInfo.last_error = serviceHealth.lastError;
+                    statusInfo.last_error_time = serviceHealth.lastErrorTime 
+                        ? new Date(serviceHealth.lastErrorTime).toISOString()
+                        : null;
+                    statusInfo.websocket_port = 3001;
+                    statusInfo.started_at = new Date(serviceHealth.startTime).toISOString();
+                }
+                
+                return {
+                    content: [
+                        {
+                            type: "text",
+                            text: JSON.stringify(statusInfo)
+                        }
+                    ]
+                };
+            });
+        }
+    );
+
+    // Connect the SDK server to STDIO transport
+    const transport = new StdioServerTransport();
+
+    // Override the transport's message handler to catch JSON parsing errors
+    const originalOnData = transport.onData;
+    transport.onData = function(data) {
+        try {
+            originalOnData.call(this, data);
+        } catch (error) {
+            if (process.env.DEBUG) {
+                safeLog.error(`[ERROR] STDIO Transport Error: ${error.message}`);
+            }
+            
+            // Update service health
+            serviceHealth.status = 'degraded';
+            serviceHealth.lastError = `STDIO Transport Error: ${error.message}`;
+            serviceHealth.lastErrorTime = Date.now();
+            
+            // Don't crash on invalid JSON
+            if (error.message.includes('JSON') && process.env.DEBUG) {
+                safeLog.error(`[ERROR] Invalid JSON received: ${data.slice(0, 100)}${data.length > 100 ? '...' : ''}`);
+            }
+        }
+    };
+
+    // Connect to the transport in STDIO mode
+    sdkServer.connect(transport)
+        .then(() => {
+            // Only log in debug mode when in STDIO mode
+            if (process.env.DEBUG) {
+                safeLog.error("MCP SDK Server connected to STDIO transport successfully");
+                safeLog.error(`
+🚀 Page Control MCP server is running in STDIO mode
+🌐 WebSocket server: ws://localhost:3001
+                `);
+            }
+        })
+        .catch((error) => {
+            // Only log errors in debug mode when in STDIO mode
+            if (process.env.DEBUG) {
+                safeLog.error(`[ERROR] Failed to initialize MCP SDK Server: ${error.message}`);
+                safeLog.error("Attempting to continue despite initialization error...");
             }
         });
+
+    // Set up periodic health check for the transport
+    setInterval(() => {
+        try {
+            // Simple ping to check if transport is alive
+            if (transport.isConnected) {
+                if (process.env.DEBUG) {
+                    safeLog.debug('HEALTH', 'STDIO transport is connected');
+                }
+            } else {
+                if (process.env.DEBUG) {
+                    safeLog.error('[WARNING] STDIO transport disconnected, waiting for reconnection...');
+                }
+            }
+        } catch (error) {
+            if (process.env.DEBUG) {
+                safeLog.error(`[ERROR] Health check error: ${error.message}`);
+            }
+        }
+    }, 30000); // Check every 30 seconds
+} 
+// ===== Create Express Server for SSE mode =====
+else {
+    // Initialize service health in SSE mode as well
+    if (!serviceHealth) {
+        // Initialize if not already defined
+        serviceHealth = {
+            status: 'ok',
+            lastError: null,
+            lastErrorTime: null,
+            wsConnectionStatus: 'ok',
+            connectedPages: activePages.size,
+            startTime: Date.now()
+        };
+    } else {
+        // Update if defined
+        serviceHealth.connectedPages = activePages.size;
     }
 
-    // Send minimal HTTP acknowledgment
-    res.json({
-        jsonrpc: '2.0',
-        id: rpc.id,
-        result: { ack: `Received ${rpc.method}` }
+    // Function to process legacy JSONRPC messages (only used by SSE)
+    const processJsonRpcMessage = (rpc, sessionId = null, sseRes = null) => {
+        logDebug('RPC', `Processing SSE message: ${rpc.method}`, rpc);
+
+        // Helper function to send a response via SSE
+        const sendResponse = (response) => {
+            if (sseRes) {
+                sseRes.write(`event: message\n`);
+                sseRes.write(`data: ${JSON.stringify(response)}\n\n`);
+                logDebug('SSE', `Sent response via SSE`, response);
+            }
+        };
+
+        switch (rpc.method) {
+            case 'initialize': {
+                if (sessionId && sessions.has(sessionId)) {
+                    sessions.get(sessionId).initialized = true;
+                }
+                
+                const response = {
+                    jsonrpc: '2.0',
+                    id: rpc.id,
+                    result: {
+                        protocolVersion: '2024-11-05',
+                        capabilities: {
+                            tools: { listChanged: true },
+                            resources: { subscribe: true, listChanged: true },
+                            prompts: { listChanged: true },
+                            logging: {}
+                        },
+                        serverInfo: {
+                            name: 'page-control-mcp',
+                            version: '1.0.0'
+                        }
+                    }
+                };
+                sendResponse(response);
+                safeLog.info(`📤 Sent initialization response via SSE`);
+                break;
+            }
+
+            case 'tools/list': {
+                const response = {
+                    jsonrpc: '2.0',
+                    id: rpc.id,
+                    result: {
+                        tools: [
+                            {
+                                name: 'query_page',
+                                description: 'Query elements on a web page using CSS selector',
+                                inputSchema: {
+                                    type: 'object',
+                                    properties: {
+                                        pageId: {
+                                            type: 'string',
+                                            description: 'ID of the connected page'
+                                        },
+                                        selector: {
+                                            type: 'string',
+                                            description: 'CSS selector to query elements'
+                                        }
+                                    },
+                                    required: ['pageId', 'selector']
+                                }
+                            },
+                            {
+                                name: 'modify_page',
+                                description: 'Modify elements on a web page',
+                                inputSchema: {
+                                    type: 'object',
+                                    properties: {
+                                        targetPage: {
+                                            type: 'string',
+                                            description: 'ID of the page to modify'
+                                        },
+                                        modification: {
+                                            type: 'object',
+                                            properties: {
+                                                selector: {
+                                                    type: 'string',
+                                                    description: 'CSS selector for target elements'
+                                                },
+                                                operation: {
+                                                    type: 'string',
+                                                    description: 'Type of modification (setAttribute, setProperty, setInnerHTML, setTextContent)'
+                                                },
+                                                value: {
+                                                    type: 'string',
+                                                    description: 'New value to set'
+                                                }
+                                            },
+                                            required: ['selector', 'operation', 'value']
+                                        }
+                                    },
+                                    required: ['targetPage', 'modification']
+                                }
+                            },
+                            {
+                                name: 'run_snippet',
+                                description: 'Execute a JavaScript code snippet in the context of the page',
+                                inputSchema: {
+                                    type: 'object',
+                                    properties: {
+                                        pageId: {
+                                            type: 'string',
+                                            description: 'ID of the page to execute the snippet on'
+                                        },
+                                        code: {
+                                            type: 'string',
+                                            description: 'JavaScript code to execute'
+                                        }
+                                    },
+                                    required: ['pageId', 'code']
+                                }
+                            },
+                            {
+                                name: 'list_pages',
+                                description: 'List all connected pages',
+                                inputSchema: {
+                                    type: 'object',
+                                    properties: {},
+                                    required: []
+                                }
+                            },
+                            {
+                                name: 'page_control_status',
+                                description: 'Get the status of the page control service',
+                                inputSchema: {
+                                    type: 'object',
+                                    properties: {
+                                        detail_level: {
+                                            type: 'string',
+                                            description: 'Level of detail to include (basic or detailed)',
+                                            enum: ['basic', 'detailed']
+                                        }
+                                    },
+                                    required: []
+                                }
+                            }
+                        ],
+                        count: 5
+                    }
+                };
+                sendResponse(response);
+                safeLog.info(`📤 Sent tools list via SSE`);
+                break;
+            }
+
+            case 'tools/call': {
+                const toolName = rpc.params?.name;
+                const args = rpc.params?.arguments || {};
+                logDebug('TOOL_CALL', `Received tool call via SSE: ${toolName}`, args);
+
+                switch (toolName) {
+                    case 'query_page': {
+                        // Register request with transport info
+                        const legacyRequestId = rpc.id;
+                        
+                        // Execute the command using the shared module
+                        executeQueryPage(args.pageId, args.selector, activePages)
+                            .then(result => {
+                                const response = {
+                                    jsonrpc: '2.0',
+                                    id: legacyRequestId,
+                                    result: {
+                                        content: [
+                                            {
+                                                type: 'text',
+                                                text: JSON.stringify(result)
+                                            }
+                                        ]
+                                    }
+                                };
+                                sendResponse(response);
+                            })
+                            .catch(error => {
+                                const errorResponse = {
+                                    jsonrpc: '2.0',
+                                    id: legacyRequestId,
+                                    error: {
+                                        code: -32000,
+                                        message: error.message
+                                    }
+                                };
+                                sendResponse(errorResponse);
+                            });
+                        break;
+                    }
+                    
+                    case 'modify_page': {
+                        // Register request with transport info
+                        const legacyRequestId = rpc.id;
+                        
+                        // Execute the command using the shared module
+                        executeModifyPage(args.targetPage, args.modification, activePages)
+                            .then(result => {
+                                const response = {
+                                    jsonrpc: '2.0',
+                                    id: legacyRequestId,
+                                    result: {
+                                        content: [
+                                            {
+                                                type: 'text',
+                                                text: JSON.stringify(result)
+                                            }
+                                        ]
+                                    }
+                                };
+                                sendResponse(response);
+                            })
+                            .catch(error => {
+                                const errorResponse = {
+                                    jsonrpc: '2.0',
+                                    id: legacyRequestId,
+                                    error: {
+                                        code: -32000,
+                                        message: error.message
+                                    }
+                                };
+                                sendResponse(errorResponse);
+                            });
+                        break;
+                    }
+                    
+                    case 'run_snippet': {
+                        // Register request with transport info
+                        const legacyRequestId = rpc.id;
+                        
+                        // Execute the command using the shared module
+                        executeRunSnippet(args.pageId, args.code, activePages)
+                            .then(result => {
+                                const response = {
+                                    jsonrpc: '2.0',
+                                    id: legacyRequestId,
+                                    result: {
+                                        content: [
+                                            {
+                                                type: 'text',
+                                                text: JSON.stringify(result)
+                                            }
+                                        ]
+                                    }
+                                };
+                                sendResponse(response);
+                            })
+                            .catch(error => {
+                                const errorResponse = {
+                                    jsonrpc: '2.0',
+                                    id: legacyRequestId,
+                                    error: {
+                                        code: -32000,
+                                        message: error.message
+                                    }
+                                };
+                                sendResponse(errorResponse);
+                            });
+                        break;
+                    }
+                    
+                    case 'list_pages': {
+                        const result = executeListPages(activePages);
+                        
+                        const response = {
+                            jsonrpc: '2.0',
+                            id: rpc.id,
+                            result: {
+                                content: [
+                                    {
+                                        type: 'text',
+                                        text: JSON.stringify(result)
+                                    }
+                                ]
+                            }
+                        };
+                        sendResponse(response);
+                        break;
+                    }
+                    
+                    case 'page_control_status': {
+                        const detail_level = args.detail_level || 'basic';
+                        
+                        // Update connected pages count before returning status
+                        syncConnectedPagesCount();
+                        
+                        // Calculate uptime
+                        const uptime = Math.floor((Date.now() - serviceHealth.startTime) / 1000);
+                        
+                        // Basic status information
+                        const statusInfo = {
+                            status: serviceHealth.status,
+                            uptime_seconds: uptime,
+                            connected_pages: serviceHealth.connectedPages,
+                            websocket_status: serviceHealth.wsConnectionStatus,
+                            server_type: "SSE"
+                        };
+                        
+                        // Add detailed information if requested
+                        if (detail_level === "detailed") {
+                            statusInfo.last_error = serviceHealth.lastError;
+                            statusInfo.last_error_time = serviceHealth.lastErrorTime 
+                                ? new Date(serviceHealth.lastErrorTime).toISOString()
+                                : null;
+                            statusInfo.websocket_port = 3001;
+                            statusInfo.started_at = new Date(serviceHealth.startTime).toISOString();
+                        }
+                        
+                        const response = {
+                            jsonrpc: '2.0',
+                            id: rpc.id,
+                            result: {
+                                content: [
+                                    {
+                                        type: 'text',
+                                        text: JSON.stringify(statusInfo)
+                                    }
+                                ]
+                            }
+                        };
+                        sendResponse(response);
+                        break;
+                    }
+
+                    default:
+                        logDebug('TOOL_ERROR', `Unknown tool: ${toolName}`);
+                        const error = {
+                            jsonrpc: '2.0',
+                            id: rpc.id,
+                            error: {
+                                code: -32601,
+                                message: `Unknown tool: ${toolName}`
+                            }
+                        };
+                        sendResponse(error);
+                        return;
+                }
+                break;
+            }
+
+            case 'notifications/initialized': {
+                logDebug('NOTIFICATION', `Client initialized via SSE`);
+                break;
+            }
+
+            case 'notifications/cancelled': {
+                logDebug('NOTIFICATION', `Request cancelled via SSE`, rpc.params);
+                // If there was a requestId, remove it from pending requests
+                if (rpc.params?.requestId) {
+                    pendingRequests.delete(rpc.params.requestId);
+                    logDebug('NOTIFICATION', `Removed cancelled request ${rpc.params.requestId} from pending requests`);
+                }
+                break;
+            }
+
+            default: {
+                logDebug('METHOD_ERROR', `Unknown method: ${rpc.method}`);
+                const error = {
+                    jsonrpc: '2.0',
+                    id: rpc.id,
+                    error: {
+                        code: -32601,
+                        message: `Method not found: ${rpc.method}`
+                    }
+                };
+                sendResponse(error);
+                logDebug('METHOD_ERROR', `Sent error response via SSE:`, error);
+            }
+        }
+    };
+
+    // Set up Express and sessions for SSE mode
+    const app = express();
+    const port = 4000;
+    
+    // Enable CORS and JSON parsing
+    app.use(cors());
+    app.use(express.json());
+    
+    // Store SSE sessions
+    const sessions = new Map();
+
+    // SSE endpoint for AI editors that support SSE, e.g. Cursor
+    app.get('/page-control', (req, res) => {
+        safeLog.info('🔌 New SSE connection from AI editor');
+
+        // SSE headers
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+
+        // Generate sessionId
+        const sessionId = uuidv4();
+        sessions.set(sessionId, { sseRes: res, initialized: false });
+        safeLog.info('📝 Created sessionId: ' + sessionId);
+
+        // Send endpoint event
+        res.write(`event: endpoint\n`);
+        res.write(`data: /message?sessionId=${sessionId}\n\n`);
+
+        // Heartbeat every 10 seconds
+        const heartbeat = setInterval(() => {
+            res.write(`event: heartbeat\ndata: ${Date.now()}\n\n`);
+        }, 10000);
+
+        // Cleanup on disconnect
+        req.on('close', () => {
+            clearInterval(heartbeat);
+            sessions.delete(sessionId);
+            safeLog.info('🔌 SSE connection closed, sessionId: ' + sessionId);
+        });
     });
-    logDebug('HTTP', `Sent HTTP acknowledgment for ${rpc.method}`);
 
-    // Handle the actual message through SSE
-    const sseRes = sessionData.sseRes;
-    if (!sseRes) {
-        logDebug('SSE_ERROR', `No SSE response found for sessionId: ${sessionId}`);
-        return;
-    }
+    // Message endpoint for JSON-RPC communication
+    app.post('/message', (req, res) => {
+        logDebug('HTTP', `Received message:`, req.body);
+        logDebug('HTTP', `Query params:`, req.query);
 
-    // Process the JSON-RPC message
-    processJsonRpcMessage(rpc, 'SSE', sessionId, sseRes);
-});
+        const sessionId = req.query.sessionId;
+        if (!sessionId) {
+            logDebug('HTTP_ERROR', 'Missing sessionId in query');
+            return res.status(400).json({ error: 'Missing sessionId in query' });
+        }
 
-// Clean up stale pending requests every minute
-setInterval(() => {
-    const now = Date.now();
-    const timeout = 30000; // 30 seconds timeout
+        const sessionData = sessions.get(sessionId);
+        if (!sessionData) {
+            logDebug('HTTP_ERROR', `No SSE session found for sessionId: ${sessionId}`);
+            return res.status(404).json({ error: 'No SSE session found for sessionId' });
+        }
 
-    // Check for timed out requests
-    for (const [id, request] of pendingRequests.entries()) {
-        if (now - request.timestamp > timeout) {
-            logDebug('TIMEOUT', `Request ${id} timed out after ${timeout}ms`);
-            
-            // Try to send error back based on transport
+        const rpc = req.body;
+        if (!rpc || rpc.jsonrpc !== '2.0' || !rpc.method) {
+            logDebug('HTTP_ERROR', 'Invalid JSON-RPC request');
+            return res.json({
+                jsonrpc: '2.0',
+                id: rpc?.id ?? null,
+                error: {
+                    code: -32600,
+                    message: 'Invalid JSON-RPC request'
+                }
+            });
+        }
+
+        // Send minimal HTTP acknowledgment
+        res.json({
+            jsonrpc: '2.0',
+            id: rpc.id,
+            result: { ack: `Received ${rpc.method}` }
+        });
+        logDebug('HTTP', `Sent HTTP acknowledgment for ${rpc.method}`);
+
+        // Handle the actual message through SSE
+        const sseRes = sessionData.sseRes;
+        if (!sseRes) {
+            logDebug('SSE_ERROR', `No SSE response found for sessionId: ${sessionId}`);
+            return;
+        }
+
+        // Process the JSON-RPC message
+        processJsonRpcMessage(rpc, sessionId, sseRes);
+    });
+
+    // Clean up stale pending requests every minute
+    setInterval(() => {
+        // Use the shared cleaner with a custom timeout handler
+        cleanupStaleRequests((id, request) => {
+            // Handle timeouts for SSE transport
             if (request.transport === 'SSE' && request.sessionId) {
                 const sessionData = sessions.get(request.sessionId);
                 if (sessionData && sessionData.sseRes) {
@@ -662,37 +922,34 @@ setInterval(() => {
                         id: parseInt(id),
                         error: {
                             code: -32001,
-                            message: `Request timed out after ${timeout}ms`
+                            message: `Request timed out after 30000ms`
                         }
                     };
                     sessionData.sseRes.write(`event: message\n`);
                     sessionData.sseRes.write(`data: ${JSON.stringify(timeoutError)}\n\n`);
                     logDebug('TIMEOUT', `Sent timeout error via SSE for request ${id}`, timeoutError);
                 }
-            } else if (request.transport === 'STDIO') {
-                const timeoutError = {
-                    jsonrpc: '2.0',
-                    id: parseInt(id),
-                    error: {
-                        code: -32001,
-                        message: `Request timed out after ${timeout}ms`
-                    }
-                };
-                sendStdioResponse(timeoutError);
-                logDebug('TIMEOUT', `Sent timeout error via STDIO for request ${id}`, timeoutError);
             }
-            
-            // Remove the timed out request
-            pendingRequests.delete(id);
-        }
-    }
-}, 60000);
+        });
+    }, 60000);
 
-app.listen(port, () => {
-    console.log(`
-🚀 Page Control MCP server is running
+    // Start the Express server in SSE mode
+    app.listen(port, () => {
+        safeLog.info(`
+🚀 Page Control MCP server is running with SSE support
 📡 SSE endpoint: http://localhost:${port}/page-control
 🌐 WebSocket server: ws://localhost:3001
-💻 STDIO transport: ${process.stdin.isTTY ? 'Available' : 'Active'}
-    `);
+        `);
+    });
+}
+
+// Handle process exit events
+process.on("SIGINT", () => {
+    logStderr("Received SIGINT, shutting down...");
+    process.exit(0);
+});
+
+process.on("SIGTERM", () => {
+    logStderr("Received SIGTERM, shutting down...");
+    process.exit(0);
 }); 
