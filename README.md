@@ -141,15 +141,18 @@ To modify the extension:
 ```
 .
 ├── mcp-server/
-│   ├── server.js          # Main MCP server
-│   ├── package.json       # Server dependencies
+│   ├── page-control-mcp.js    # Main MCP server implementation
+│   ├── page-control-commands.js # Command execution module
+│   ├── package.json          # Server dependencies
 │   └── ...
 ├── extension/
-│   ├── manifest.json      # Extension configuration
-│   ├── background.js      # Background script
-│   ├── content.js         # Content script
+│   ├── manifest.json         # Extension configuration
+│   ├── background.js         # Background script
+│   ├── content.js            # Content script
+│   ├── icons/                # Extension icons
 │   └── ...
-└── README.md              # This file
+├── LICENSE                   # License information
+└── README.md                 # This file
 ```
 
 ## Troubleshooting
