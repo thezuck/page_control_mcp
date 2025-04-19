@@ -55,7 +55,7 @@ Create or update the `.cursor/mcp.json` file in your home directory or update th
      }
    }
    ```
-#### For STDIO - note you have to replace the <<Path to mcp server directory>> with your own local path
+#### For STDIO - note you have to replace the \<\<Path to mcp server directory\>\> with your own local path
    ```json
    {
      "mcpServers": {
