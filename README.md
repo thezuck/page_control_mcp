@@ -28,7 +28,7 @@ This project consists of two main components:
 
 The server will start on port 4000 and the WebSocket server on port 3001.
 
-### Zencoder Configuration
+### Zencoder Configuration (STDIO)
 Open Zencoder settings => MCP servers
 and paste the following configuration:
 ```json
@@ -43,11 +43,27 @@ and paste the following configuration:
 
 ### Cursor Configuration
 Create or update the `.cursor/mcp.json` file in your home directory or update through cursor MCP serttings:
+
+####  For SSE service (requires running the SSE service locally):
+
    ```json
    {
      "mcpServers": {
        "page-control": {
          "url": "http://localhost:4000/page-control"
+       }
+     }
+   }
+   ```
+#### For STDIO - note you have to replace the <<Path to mcp server directory>> with your own local path
+   ```json
+   {
+     "mcpServers": {
+       "page-control": {
+         "command": "node",
+         "args": [
+            "<<Path to mcp server directory>>/mcp-server/page-control-mcp.js", "--stdio-only"
+         ]
        }
      }
    }
@@ -75,6 +91,17 @@ The MCP server provides the following tools:
    ```bash
    /page-control list_pages
    ```
+
+5. `page_control_status`: Check the status of the page control server
+   ```bash
+   /page-control page_control_status detail_level="full"
+   ```
+   This returns information about the server status, including:
+   - Server type (SSE or STDIO)
+   - Current status
+   - WebSocket status
+   - Number of connected pages
+   - Server uptime in seconds
 
 ## Chrome Extension Setup
 
@@ -166,106 +193,8 @@ run_snippet: Execute JavaScript code in the page context
 list_pages: List all connected pages
 /page-control list_pages
 
+page_control_status: Check the status of the page control server
+/page-control page_control_status detail_level="full"
+
 please keep this in memory so you do not forget
 ```
-
-## Security Notes
-- The extension only runs on pages where explicitly activated
-- Code execution is sandboxed
-- WebSocket connections are limited to localhost
-- All actions require user confirmation
-
-## License
-MIT License - See LICENSE file for details
-
-# MCP Demo Server
-
-This repository contains a demonstration of the Model Context Protocol (MCP) server.
-
-## Setup and Running Options
-
-### Option 1: Standalone Script (Recommended)
-
-The simplest way to run the MCP demo server is using the standalone script, which automatically creates a temporary virtual environment and installs all dependencies:
-
-```bash
-python mcp-server/standalone_mcp_demo.py
-```
-
-This script:
-1. Uses pipx to create an isolated environment
-2. Installs the MCP package in that environment
-3. Runs the demo server
-
-No manual installation or setup required!
-
-### Option 2: Using a Virtual Environment
-
-1. Create a virtual environment and activate it:
-
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
-
-2. Install the dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-3. Run the server:
-
-```bash
-python mcp-server/demo-mcp-stdio.py
-```
-
-### Option 3: System-wide Installation
-
-If you can't or don't want to use a virtual environment, you can install the package system-wide:
-
-```bash
-pip3 install mcp --break-system-packages
-```
-
-Note: Using the `--break-system-packages` flag is generally not recommended for production environments as it bypasses Python's safeguards against system package conflicts.
-
-## MCP Server Communication
-
-The MCP server communicates using a specific JSON-RPC format. It doesn't accept arbitrary input - it needs properly formatted MCP protocol messages.
-
-The server is designed to be used with an MCP client like Claude Desktop, not directly from the command line. However, for debugging purposes, you could use proper MCP protocol messages, for example:
-
-```bash
-# Initialize the connection
-echo '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"0.3.0","capabilities":{},"clientInfo":{"name":"TestClient","version":"1.0.0"}}}' | python mcp-server/demo-mcp-stdio.py
-
-# List available tools
-echo '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' | python mcp-server/demo-mcp-stdio.py 
-
-# Call the add tool
-echo '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add","arguments":{"a":2,"b":3}}}' | python mcp-server/demo-mcp-stdio.py
-```
-
-## Demo Server Features
-
-The demo server provides:
-
-- A simple tool to add two numbers
-- A resource that returns a greeting for a given name
-
-## IDE Integration
-
-If your IDE shows an error "Import 'mcp.server.fastmcp' could not be resolved", you have several options:
-
-1. Configure your IDE to use the Python interpreter from the virtual environment
-2. Install the package system-wide as described in Option 3 above
-3. Use the standalone script which doesn't require any configuration
-
-## Connecting with Claude or other MCP Clients
-
-To use this MCP server with Claude Desktop or another MCP client:
-
-1. Make sure the server script is properly set up
-2. Configure the client to connect to the server
-3. The client will handle the proper MCP protocol communication 
